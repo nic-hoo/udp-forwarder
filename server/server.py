@@ -35,15 +35,59 @@ DEFAULT_SESSION_TIMEOUT = 60
 DEFAULT_CLEANUP_INTERVAL = 10
 
 # ============================================================
+# IPv6 auto-detection tuning
+# ------------------------------------------------------------
+# Special-use prefixes INSIDE 2000::/3 that should be treated as
+# "virtual" and excluded when picking the listening address:
+#   - 2001:0::/32  : Teredo tunnel (Windows often enables by default)
+#   - 2002::/16    : 6to4 tunnel (auto-derived from public IPv4)
+# Also excluded (outside 2000::/3, listed for clarity):
+#   - fe80::/10    : link-local
+#   - fc00::/7     : ULA (Unique Local Address)
+# ============================================================
+EXCLUDED_IPV6_PREFIXES = (
+    "2001:0:",     "2001:0000:",   # Teredo  2001:0::/32
+    "2002:",                        # 6to4    2002::/16
+)
+
+# Multiple public IPv6 targets for source-address probing.
+# Probing several targets makes the result robust against single-route
+# quirks (e.g. when the OS routing table sends one target through a
+# virtual tunnel but the real NIC is the correct egress for others).
+PROBE_IPV6_TARGETS = (
+    "2606:4700:4700::1111",   # Cloudflare DNS primary
+    "2606:4700:4700::1001",   # Cloudflare DNS secondary
+    "2001:4860:4860::8888",   # Google DNS primary
+    "2001:4860:4860::8844",   # Google DNS secondary
+)
+
+# Heuristic: interface name fragments that indicate a virtual adapter.
+# Used only to RANK candidates (never to silently drop a working address).
+VIRTUAL_INTERFACE_HINTS = (
+    "loopback", "pseudo",
+    "teredo", "isatap", "6to4",
+    "vethernet", "docker", "veth", "br-",
+    "tun", "tap", "wg", "utun", "bridge",
+    "wsl", "hyper-v", "virtual",
+)
+
+# ============================================================
 # Default server config (used when server_config.json is missing)
 # Format: [external_port]  OR  [external_port, local_port]
 #         OR  [external_port, local_ipv4, local_port]
+#
+# Optional keys:
+#   "listen_ipv6": "<addr>"   - skip auto-detection and use this IPv6.
+#                               Set this if auto-detection picks a virtual
+#                               adapter (Teredo / 6to4 / Hyper-V / WSL /
+#                               Docker / VPN) on a multi-NIC host.
 # ============================================================
 DEFAULT_SERVER_CONFIG = {
     "port_mappings": [
         [25565],
         [19132],
     ],
+    "listen_ipv6": "",  # leave empty for auto-detection
 }
 
 # When packaged with PyInstaller (--onefile), __file__ points to a temp
@@ -109,28 +153,160 @@ def normalize_port_mappings(raw_mappings, default_target_ipv4):
     return result
 
 
-def detect_local_global_ipv6():
-    """Auto-detect local global IPv6 address (2000::/3, non-link-local)."""
+def _is_real_global_ipv6(addr):
+    """True if `addr` is a real (non-virtual) global unicast IPv6 address.
+
+    Excludes:
+      - Link-local (fe80::/10)
+      - ULA (fc00::/7)
+      - Teredo tunnel (2001:0::/32)
+      - 6to4 tunnel (2002::/16)
+
+    Accepts addresses with a zone-id suffix (e.g. "fe80::1%eth0").
+    """
+    if not addr:
+        return False
+    raw = addr.split("%")[0].lower().strip()
+    if not raw:
+        return False
+    # Must be a global unicast address (2000::/3)
+    if not raw.startswith("2"):
+        return False
+    # Reject known virtual / transition prefixes inside 2000::/3
+    for prefix in EXCLUDED_IPV6_PREFIXES:
+        if raw.startswith(prefix):
+            return False
+    return True
+
+
+def _is_virtual_interface(ifname):
+    """Heuristic: does `ifname` look like a virtual / loopback adapter?"""
+    if not ifname:
+        return False
+    low = ifname.lower()
+    return any(hint in low for hint in VIRTUAL_INTERFACE_HINTS)
+
+
+def _probe_source_ipv6(target):
+    """Return the local source IPv6 address that would be used to reach `target`.
+
+    Uses a connected UDP socket (no packets are actually sent) and reads the
+    source address the kernel chose. Returns None on any error.
+    """
     try:
         s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        s.connect(("2606:4700:4700::1111", 53))
-        addr = s.getsockname()[0]
-        s.close()
-        if addr.startswith("2"):
-            return addr
+        s.settimeout(2)
+        try:
+            s.connect((target, 53))
+            return s.getsockname()[0]
+        finally:
+            s.close()
     except OSError:
+        return None
+
+
+def _enumerate_global_ipv6():
+    """List all real global IPv6 addresses on the host.
+
+    Returns a list of (addr, ifname) tuples. `ifname` is None when psutil is
+    unavailable. Tries psutil first (gives interface names + filters downed
+    interfaces), falls back to getaddrinfo (hostname-bound addresses only).
+    """
+    results = []
+
+    # Preferred path: psutil gives per-interface addresses + link state
+    try:
+        import psutil  # type: ignore
+        try:
+            stats = psutil.net_if_stats()
+        except Exception:
+            stats = {}
+        try:
+            addrs_by_if = psutil.net_if_addrs()
+        except Exception:
+            addrs_by_if = {}
+        for ifname, addrs in addrs_by_if.items():
+            # Skip interfaces that are down (avoids picking stale addresses)
+            st = stats.get(ifname)
+            if st is not None and not st.isup:
+                continue
+            for a in addrs:
+                if a.family == socket.AF_INET6 and _is_real_global_ipv6(a.address):
+                    results.append((a.address.split("%")[0], ifname))
+        if results:
+            return results
+    except ImportError:
         pass
-    # Fallback: enumerate interfaces
+
+    # Fallback: getaddrinfo (returns addresses bound to the hostname)
     try:
         hostname = socket.gethostname()
         infos = socket.getaddrinfo(hostname, None, socket.AF_INET6)
         for info in infos:
             addr = info[4][0]
-            if addr.startswith("2") and not addr.startswith("fe80"):
-                return addr.split("%")[0]
+            if _is_real_global_ipv6(addr):
+                results.append((addr.split("%")[0], None))
     except OSError:
         pass
-    return None
+    return results
+
+
+def detect_local_global_ipv6():
+    """Auto-detect the best local global IPv6 address for listening.
+
+    Multi-NIC safe strategy (in order):
+      1. Probe several public IPv6 targets via UDP connect and collect the
+         source addresses the kernel actually uses for outbound traffic.
+         Keep only real GUAs (filters Teredo / 6to4). Pick the one that
+         appears most often - this is the egress interface external clients
+         will most likely reach us through.
+      2. If probing yields nothing usable, enumerate all interfaces and
+         return the first real GUA on a non-virtual adapter.
+      3. Return None if nothing qualifies.
+
+    The detection is logged by the caller via the return value plus the
+    companion `list_local_global_ipv6_candidates()` helper.
+    """
+    # ---- Strategy 1: probe-based source discovery -------------------
+    source_counts = {}
+    for target in PROBE_IPV6_TARGETS:
+        src = _probe_source_ipv6(target)
+        if not src:
+            continue
+        src_clean = src.split("%")[0].lower()
+        if _is_real_global_ipv6(src_clean):
+            source_counts[src_clean] = source_counts.get(src_clean, 0) + 1
+    if source_counts:
+        # Most frequently observed real source address wins
+        return max(source_counts.items(), key=lambda kv: kv[1])[0]
+
+    # ---- Strategy 2: enumerate interfaces ---------------------------
+    candidates = _enumerate_global_ipv6()
+    if not candidates:
+        return None
+    # Prefer addresses on physical (non-virtual) interfaces
+    physical = [(a, i) for a, i in candidates if not _is_virtual_interface(i)]
+    chosen = physical[0] if physical else candidates[0]
+    return chosen[0]
+
+
+def list_local_global_ipv6_candidates():
+    """Return a human-readable list of all real global IPv6 candidates.
+
+    Used for logging so the operator can see what was found and, if needed,
+    manually pin one via the `listen_ipv6` config key.
+    """
+    seen = {}
+    # Include probe results
+    for target in PROBE_IPV6_TARGETS:
+        src = _probe_source_ipv6(target)
+        if src and _is_real_global_ipv6(src):
+            clean = src.split("%")[0].lower()
+            seen.setdefault(clean, "probe")
+    # Include interface enumeration
+    for addr, ifname in _enumerate_global_ipv6():
+        seen.setdefault(addr, ifname or "iface")
+    return list(seen.items())
 
 
 def test_ipv4():
@@ -315,14 +491,40 @@ def main():
         log(f"       {ext}  ->  {ipv4}:{port}")
 
     log("-" * 60)
-    log("Detecting local global IPv6 address...")
-    local_v6 = detect_local_global_ipv6()
-    if local_v6:
-        log(f"[OK]   Local IPv6: {local_v6}")
-        log(f"       External clients should connect to: [{local_v6}]:<port>")
+
+    # Manual override: if the operator pinned an IPv6 in config, use it as-is.
+    # Accepts both the bare address and a [addr] form; case-insensitive.
+    manual_ipv6 = cfg.get("listen_ipv6")
+    if isinstance(manual_ipv6, str):
+        manual_ipv6 = manual_ipv6.strip()
+    if manual_ipv6:
+        log(f"[cfg] listen_ipv6 override: {manual_ipv6}")
+        log(f"[OK]   Local IPv6: {manual_ipv6}")
+        log(f"       External clients should connect to: [{manual_ipv6}]:<port>")
+        log("-" * 60)
     else:
-        log("[WARN] No global IPv6 address detected. Will still listen on '::'.")
-    log("-" * 60)
+        log("Detecting local global IPv6 address...")
+        local_v6 = detect_local_global_ipv6()
+        if local_v6:
+            log(f"[OK]   Local IPv6: {local_v6}")
+            log(f"       External clients should connect to: [{local_v6}]:<port>")
+            # Show all candidates so the operator can spot a wrong pick and
+            # pin the right one via listen_ipv6 in config.
+            try:
+                candidates = list_local_global_ipv6_candidates()
+            except Exception:
+                candidates = []
+            if len(candidates) > 1:
+                log(f"       Multiple IPv6 candidates detected ({len(candidates)}):")
+                for addr, src in candidates:
+                    tag = "" if addr == local_v6 else "  (not selected)"
+                    log(f"         - {addr}   [via {src}]{tag}")
+                log("       If the selected address is wrong, pin the correct")
+                log("       one by adding \"listen_ipv6\": \"<addr>\" to server_config.json.")
+        else:
+            log("[WARN] No global IPv6 address detected. Will still listen on '::'.")
+            log("       You can pin one manually via \"listen_ipv6\" in server_config.json.")
+        log("-" * 60)
 
     if not run_network_tests():
         log("Aborting: network tests failed.")
