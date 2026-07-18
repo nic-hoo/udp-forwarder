@@ -52,8 +52,11 @@ EXCLUDED_IPV6_PREFIXES = (
 
 # Multiple public IPv6 targets for source-address probing.
 # Probing several targets makes the result robust against single-route
-# quirks (e.g. when the OS routing table sends one target through a
-# virtual tunnel but the real NIC is the correct egress for others).
+# quirks. NOTE: probe results are *cross-checked* against interface names
+# before being trusted - a probe source that lives on a virtual interface
+# (e.g. CloudflareWARP hijacking 2606:4700::/32 traffic) is rejected and
+# we fall back to interface enumeration. So it is safe to include
+# Cloudflare DNS here even when WARP might be running.
 PROBE_IPV6_TARGETS = (
     "2606:4700:4700::1111",   # Cloudflare DNS primary
     "2606:4700:4700::1001",   # Cloudflare DNS secondary
@@ -61,14 +64,24 @@ PROBE_IPV6_TARGETS = (
     "2001:4860:4860::8844",   # Google DNS secondary
 )
 
-# Heuristic: interface name fragments that indicate a virtual adapter.
-# Used only to RANK candidates (never to silently drop a working address).
+# Heuristic: interface name fragments that indicate a virtual / tunnel /
+# loopback adapter. Used to RANK candidates - addresses on such interfaces
+# are only picked when no physical NIC address is available.
 VIRTUAL_INTERFACE_HINTS = (
-    "loopback", "pseudo",
-    "teredo", "isatap", "6to4",
-    "vethernet", "docker", "veth", "br-",
-    "tun", "tap", "wg", "utun", "bridge",
-    "wsl", "hyper-v", "virtual",
+    # Loopback / pseudo
+    "loopback", "pseudo", "lo",
+    # Windows transition / virtual
+    "teredo", "isatap", "6to4", "vethernet", "hyper-v", "wsl",
+    # Container / bridge
+    "docker", "veth", "br-", "bridge", "cni", "flannel",
+    # Tunnel / VPN devices (generic + named services)
+    "tun", "tap", "wg", "utun", "ppp", "ovpn", "ipsec",
+    "warp", "cloudflare", "tailscale", "zerotier", "hamachi",
+    "nord", "express", "mullvad", "surfshark", "protonvpn",
+    # Hurricane Electric tunnel broker
+    "he-ipv6", "he-tunnel", "sit",
+    # Generic
+    "virtual",
 )
 
 # ============================================================
@@ -179,6 +192,23 @@ def _is_real_global_ipv6(addr):
     return True
 
 
+def _canonical_ipv6(addr):
+    """Normalize an IPv6 address to canonical lowercase form (no zone-id).
+
+    Uses ipaddress.IPv6Address for canonicalization so that "2408:8256:87B::1"
+    and "2408:8256:087b:0000:0000:0000:0000:0001" compare equal.
+    Returns None on parse failure.
+    """
+    if not addr:
+        return None
+    raw = addr.split("%")[0].strip()
+    try:
+        import ipaddress
+        return str(ipaddress.IPv6Address(raw))
+    except (ValueError, ImportError):
+        return raw.lower() if raw else None
+
+
 def _is_virtual_interface(ifname):
     """Heuristic: does `ifname` look like a virtual / loopback adapter?"""
     if not ifname:
@@ -205,16 +235,49 @@ def _probe_source_ipv6(target):
         return None
 
 
+def _parse_proc_net_if_inet6():
+    """Parse /proc/net/if_inet6 (Linux only). Returns [(canonical_addr, ifname)].
+
+    File format (one row per address):
+      <addr_hex_32> <ifindex_hex> <prefix_hex> <scope_hex> <flags_hex> <ifname>
+    scope 00 == global. Address is 32 hex chars, no colons.
+
+    This gives us interface names WITHOUT depending on psutil, which is the
+    key to filtering CloudflareWARP / Tailscale / etc. on minimal servers.
+    """
+    result = []
+    try:
+        with open("/proc/net/if_inet6", "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 6:
+                    continue
+                addr_hex, _ifindex, _prefix, scope, _flags, ifname = parts[:6]
+                if len(addr_hex) != 32 or scope != "00":
+                    continue
+                # Group hex into 8 x 4 chars, join with ":"
+                groups = [addr_hex[i:i + 4] for i in range(0, 32, 4)]
+                addr_str = ":".join(groups)
+                canon = _canonical_ipv6(addr_str)
+                if canon:
+                    result.append((canon, ifname))
+    except (OSError, IOError):
+        pass
+    return result
+
+
 def _enumerate_global_ipv6():
     """List all real global IPv6 addresses on the host.
 
-    Returns a list of (addr, ifname) tuples. `ifname` is None when psutil is
-    unavailable. Tries psutil first (gives interface names + filters downed
-    interfaces), falls back to getaddrinfo (hostname-bound addresses only).
+    Returns a list of (canonical_addr, ifname) tuples. `ifname` is None when
+    no source could provide it. Sources are tried in order:
+      1. psutil (cross-platform, includes link state)
+      2. /proc/net/if_inet6 (Linux only, no extra deps)
+      3. getaddrinfo (cross-platform, no interface names)
     """
     results = []
 
-    # Preferred path: psutil gives per-interface addresses + link state
+    # Path 1: psutil - gives per-interface addresses + link state
     try:
         import psutil  # type: ignore
         try:
@@ -232,20 +295,31 @@ def _enumerate_global_ipv6():
                 continue
             for a in addrs:
                 if a.family == socket.AF_INET6 and _is_real_global_ipv6(a.address):
-                    results.append((a.address.split("%")[0], ifname))
+                    canon = _canonical_ipv6(a.address) or a.address.split("%")[0]
+                    results.append((canon, ifname))
         if results:
             return results
     except ImportError:
         pass
 
-    # Fallback: getaddrinfo (returns addresses bound to the hostname)
+    # Path 2: /proc/net/if_inet6 (Linux). No external deps required.
+    if os.path.exists("/proc/net/if_inet6"):
+        for addr, ifname in _parse_proc_net_if_inet6():
+            if _is_real_global_ipv6(addr):
+                results.append((addr, ifname))
+        if results:
+            return results
+
+    # Path 3: getaddrinfo fallback (returns hostname-bound addresses only,
+    # no interface names - we lose the ability to filter by interface).
     try:
         hostname = socket.gethostname()
         infos = socket.getaddrinfo(hostname, None, socket.AF_INET6)
         for info in infos:
             addr = info[4][0]
             if _is_real_global_ipv6(addr):
-                results.append((addr.split("%")[0], None))
+                canon = _canonical_ipv6(addr) or addr.split("%")[0]
+                results.append((canon, None))
     except OSError:
         pass
     return results
@@ -254,59 +328,110 @@ def _enumerate_global_ipv6():
 def detect_local_global_ipv6():
     """Auto-detect the best local global IPv6 address for listening.
 
-    Multi-NIC safe strategy (in order):
-      1. Probe several public IPv6 targets via UDP connect and collect the
-         source addresses the kernel actually uses for outbound traffic.
-         Keep only real GUAs (filters Teredo / 6to4). Pick the one that
-         appears most often - this is the egress interface external clients
-         will most likely reach us through.
-      2. If probing yields nothing usable, enumerate all interfaces and
-         return the first real GUA on a non-virtual adapter.
-      3. Return None if nothing qualifies.
+    Multi-NIC + VPN safe strategy. The critical insight is that probe-based
+    detection alone is NOT enough: VPN tunnels (CloudflareWARP, Tailscale,
+    full-tunnel OpenVPN, ...) hijack the kernel's source-address selection,
+    so probe results often point at the tunnel address rather than the
+    physical NIC. We therefore cross-check probe sources against interface
+    names and prefer physical adapters.
 
-    The detection is logged by the caller via the return value plus the
-    companion `list_local_global_ipv6_candidates()` helper.
+    Strategy:
+      1. Probe several public IPv6 targets, collect source addresses + counts.
+      2. Enumerate all interfaces (psutil / /proc/net/if_inet6 / getaddrinfo).
+         Build addr -> ifname map.
+      3. If any probe source lives on a PHYSICAL interface, pick the most
+         frequently probed such address. This is the best case - we have
+         both reachability confirmation and a real NIC.
+      4. Otherwise, fall back to interface enumeration: pick the first real
+         GUA on a physical adapter. If only virtual adapters exist (e.g.
+         everything is behind a VPN), use the first virtual one as a
+         last resort so we still return *something* usable.
+      5. If interface enumeration also yields nothing, return any probe
+         result we managed to collect (last resort, no interface info).
+      6. Return None if nothing qualifies.
     """
-    # ---- Strategy 1: probe-based source discovery -------------------
-    source_counts = {}
+    # ---- Step 1: probe-based source discovery -----------------------
+    probe_counts = {}  # canonical_addr -> count
     for target in PROBE_IPV6_TARGETS:
         src = _probe_source_ipv6(target)
         if not src:
             continue
-        src_clean = src.split("%")[0].lower()
-        if _is_real_global_ipv6(src_clean):
-            source_counts[src_clean] = source_counts.get(src_clean, 0) + 1
-    if source_counts:
-        # Most frequently observed real source address wins
-        return max(source_counts.items(), key=lambda kv: kv[1])[0]
+        canon = _canonical_ipv6(src)
+        if canon and _is_real_global_ipv6(canon):
+            probe_counts[canon] = probe_counts.get(canon, 0) + 1
 
-    # ---- Strategy 2: enumerate interfaces ---------------------------
-    candidates = _enumerate_global_ipv6()
-    if not candidates:
-        return None
-    # Prefer addresses on physical (non-virtual) interfaces
-    physical = [(a, i) for a, i in candidates if not _is_virtual_interface(i)]
-    chosen = physical[0] if physical else candidates[0]
-    return chosen[0]
+    # ---- Step 2: interface enumeration -----------------------------
+    iface_candidates = _enumerate_global_ipv6()  # [(canonical_addr, ifname)]
+    addr_to_ifname = {a: i for a, i in iface_candidates}
+
+    # ---- Step 3: probe results on physical interfaces --------------
+    if probe_counts and addr_to_ifname:
+        physical_probe = []   # [(addr, count)]
+        for addr, count in probe_counts.items():
+            ifname = addr_to_ifname.get(addr)
+            # Only trust probe sources we can attribute to a physical NIC.
+            # If the address is on a known virtual interface (CloudflareWARP,
+            # docker0, veth*, tun*, ...) we skip it and let Step 4 handle it.
+            if ifname and not _is_virtual_interface(ifname):
+                physical_probe.append((addr, count))
+        if physical_probe:
+            # Most frequently observed physical source address wins
+            return max(physical_probe, key=lambda x: x[1])[0]
+
+    # ---- Step 4: physical NIC from interface enumeration ------------
+    if iface_candidates:
+        physical = [(a, i) for a, i in iface_candidates
+                    if not _is_virtual_interface(i)]
+        if physical:
+            # If we also have probe results, prefer physical addresses
+            # that were probed (cross-validated reachability).
+            if probe_counts:
+                physical_probed = [(a, i) for a, i in physical
+                                   if a in probe_counts]
+                if physical_probed:
+                    return physical_probed[0][0]
+            # Otherwise just take the first physical GUA
+            return physical[0][0]
+        # Only virtual adapters available (e.g. fully behind WARP).
+        # Use the first one as a last resort - the user can still override
+        # via listen_ipv6 in config.
+        return iface_candidates[0][0]
+
+    # ---- Step 5: probe results without interface info ---------------
+    # (e.g. psutil missing AND not Linux AND getaddrinfo returned nothing)
+    if probe_counts:
+        return max(probe_counts.items(), key=lambda kv: kv[1])[0]
+
+    # ---- Step 6: nothing usable -------------------------------------
+    return None
 
 
 def list_local_global_ipv6_candidates():
-    """Return a human-readable list of all real global IPv6 candidates.
+    """Return a list of (canonical_addr, ifname_or_probe) for logging.
 
-    Used for logging so the operator can see what was found and, if needed,
-    manually pin one via the `listen_ipv6` config key.
+    Lets the operator see every candidate with its source, so they can spot
+    a wrong auto-pick and pin the right one via `listen_ipv6` in config.
     """
-    seen = {}
-    # Include probe results
+    seen = {}  # canonical_addr -> (ifname_or_"probe", is_virtual)
+
+    # Probe results
     for target in PROBE_IPV6_TARGETS:
         src = _probe_source_ipv6(target)
         if src and _is_real_global_ipv6(src):
-            clean = src.split("%")[0].lower()
-            seen.setdefault(clean, "probe")
-    # Include interface enumeration
+            canon = _canonical_ipv6(src)
+            if canon:
+                seen.setdefault(canon, ("probe", False))
+
+    # Interface enumeration - may upgrade existing entries with ifname
     for addr, ifname in _enumerate_global_ipv6():
-        seen.setdefault(addr, ifname or "iface")
-    return list(seen.items())
+        is_virt = _is_virtual_interface(ifname) if ifname else False
+        if addr not in seen:
+            seen[addr] = (ifname or "iface", is_virt)
+        else:
+            # Upgrade: replace "probe" label with actual interface name
+            seen[addr] = (ifname or "probe", is_virt)
+
+    return [(addr, label, is_virt) for addr, (label, is_virt) in seen.items()]
 
 
 def test_ipv4():
@@ -393,7 +518,21 @@ def run_forwarder(port_mappings):
     for external_port, target_ipv4, target_port in port_mappings:
         try:
             sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            # IPv6-only listener. This forwarder's purpose is to accept IPv6
+            # clients and bridge them to an IPv4 local service. Setting
+            # V6ONLY=1 (instead of 0) is important for two reasons:
+            #   1. It avoids "Address already in use" when external_port ==
+            #      local_port and the local IPv4 service is bound to
+            #      127.0.0.1:<port> or 0.0.0.0:<port> (dual-stack wildcard
+            #      would collide on the IPv4 side).
+            #   2. It also avoids the local forwarder receiving its own
+            #      forwarded packets (IPv4 loopback) and creating loops.
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            # Allow quick restart / coexist with other sockets in edge cases.
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except OSError:
+                pass
             sock.bind((listen_ipv6, external_port))
             sock.setblocking(False)
             v6_to_config[sock] = (external_port, target_ipv4, target_port)
@@ -514,11 +653,25 @@ def main():
                 candidates = list_local_global_ipv6_candidates()
             except Exception:
                 candidates = []
-            if len(candidates) > 1:
-                log(f"       Multiple IPv6 candidates detected ({len(candidates)}):")
-                for addr, src in candidates:
-                    tag = "" if addr == local_v6 else "  (not selected)"
-                    log(f"         - {addr}   [via {src}]{tag}")
+            # Always show the candidate list when there's more than one, or
+            # when the selected address is on a virtual interface (so the
+            # operator is warned and can override).
+            selected_is_virtual = False
+            for addr, _src, is_virt in candidates:
+                if addr == local_v6 and is_virt:
+                    selected_is_virtual = True
+                    break
+            if selected_is_virtual:
+                log("[WARN] Auto-picked address is on a virtual/tunnel adapter.")
+                log("       This usually means no physical NIC with a real public")
+                log("       IPv6 was found (e.g. the host is fully behind a VPN).")
+                log("       Consider pinning the correct address via listen_ipv6.")
+            if len(candidates) > 1 or selected_is_virtual:
+                log(f"       IPv6 candidates detected ({len(candidates)}):")
+                for addr, src, is_virt in candidates:
+                    virt_tag = " [virtual]" if is_virt else ""
+                    sel_tag = "" if addr == local_v6 else "  (not selected)"
+                    log(f"         - {addr}   [via {src}{virt_tag}]{sel_tag}")
                 log("       If the selected address is wrong, pin the correct")
                 log("       one by adding \"listen_ipv6\": \"<addr>\" to server_config.json.")
         else:
