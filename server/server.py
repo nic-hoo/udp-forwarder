@@ -17,14 +17,29 @@ import time
 import sys
 import json
 import os
+import subprocess
 import urllib.request
 from datetime import datetime
 
 # ============================================================
-# Hardcoded network test targets (domestic CN nodes, stable)
+# Network connectivity test targets
+# ------------------------------------------------------------
+# Raw TCP socket connect to port 443 on well-known anycast IPs.
+# Bypasses HTTP/SOCKS application-level proxies. See client.py
+# for the full rationale.
 # ============================================================
-IPV4_TEST_URL = "https://www.baidu.com"
-IPV6_TEST_URL = "https://www.taobao.com"
+IPV4_PROBE_TARGETS = (
+    ("223.5.5.5", 443),           # Alibaba DNS (China, fast)
+    ("119.29.29.29", 443),        # Tencent DNS (China)
+    ("8.8.8.8", 443),             # Google DNS (fallback)
+    ("1.1.1.1", 443),             # Cloudflare DNS (fallback)
+)
+
+IPV6_PROBE_TARGETS = (
+    ("2606:4700:4700::1111", 443),  # Cloudflare DNS
+    ("2001:4860:4860::8888", 443),  # Google DNS
+    ("240c::6666", 443),            # CERNET2 (China, if reachable)
+)
 
 # ============================================================
 # Forwarder defaults
@@ -33,6 +48,36 @@ DEFAULT_TARGET_IPV4 = "127.0.0.1"   # forward to local IPv4 service by default
 DEFAULT_BUFFER_SIZE = 65535
 DEFAULT_SESSION_TIMEOUT = 60
 DEFAULT_CLEANUP_INTERVAL = 10
+
+# ============================================================
+# VPN / proxy / game accelerator detection
+# ------------------------------------------------------------
+# Same patterns as client.py. Kept duplicated (not shared) so the
+# server can run standalone without importing the client module.
+# ============================================================
+VPN_PROCESS_PATTERNS = (
+    "clash", "mihomo", "v2ray", "v2rayn", "xray", "sing-box",
+    "shadowsocks", "shadowsocksr", "ssr", "trojan", "naive",
+    "warp", "wireguard", "wg", "tailscale", "openvpn", "ovpn",
+    "hamachi", "zerotier", "zerotier-one",
+    "nordvpn", "expressvpn", "mullvad", "surfshark", "protonvpn",
+    "cyberghost", "pia-", "privatevpn",
+    "surgemac", "quantumult", "shadowrocket", "peclash",
+)
+
+ACCELERATOR_PROCESS_PATTERNS = (
+    "uu.exe", "uu_", "uuacc",
+    "xunyou", "xyacc",
+    "leigod", "leidianacc", "leidian",
+    "biubiu",
+    "tgpacc", "txgameaccelerator", "qqacc",
+    "xunleiacc",
+    "haitunacc", "haitun",
+    "27acc",
+    "qianlanacc",
+    "uu网游", "uu加速",
+    "加速器",
+)
 
 # ============================================================
 # IPv6 auto-detection tuning
@@ -115,6 +160,136 @@ SERVER_CONFIG_PATH = os.path.join(SCRIPT_DIR, "server_config.json")
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+# ============================================================
+# VPN / proxy / game accelerator detection (server-side)
+# ============================================================
+def _list_process_names():
+    """Return a list of running process names (best-effort, cross-platform)."""
+    try:
+        import psutil  # type: ignore
+        names = []
+        for p in psutil.process_iter(["name"]):
+            try:
+                n = p.info.get("name")
+                if n:
+                    names.append(n)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        if names:
+            return names
+    except (ImportError, Exception):
+        pass
+
+    if sys.platform == "win32":
+        try:
+            res = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                capture_output=True, timeout=5,
+                encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            stdout = res.stdout or ""
+            names = []
+            for line in stdout.splitlines():
+                line = line.strip()
+                if line.startswith('"'):
+                    name = line.split('","', 1)[0].strip('"')
+                    if name:
+                        names.append(name)
+            return names
+        except (OSError, subprocess.SubprocessError):
+            return []
+    else:
+        try:
+            res = subprocess.run(
+                ["ps", "-e", "-o", "comm="],
+                capture_output=True, timeout=5,
+                errors="replace",
+            )
+            stdout = res.stdout or ""
+            return [l.strip() for l in stdout.splitlines() if l.strip()]
+        except (OSError, subprocess.SubprocessError):
+            return []
+
+
+def _get_system_proxy():
+    """Return first system proxy URL, or None if no proxy is configured."""
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception:
+        return None
+    if not proxies:
+        return None
+    for key in ("http", "https", "ftp", "all"):
+        if key in proxies:
+            return proxies[key]
+    return next(iter(proxies.values()))
+
+
+def detect_vpn_and_accelerators():
+    """Detect VPN / proxy / game accelerator presence on this host.
+
+    Returns a dict with system_proxy, vpn_processes, accelerator_processes.
+    Best-effort: never raises.
+    """
+    findings = {
+        "system_proxy": None,
+        "vpn_processes": [],
+        "accelerator_processes": [],
+    }
+
+    findings["system_proxy"] = _get_system_proxy()
+
+    procs = _list_process_names()
+    seen_vpn = set()
+    seen_acc = set()
+    for name in procs:
+        low = name.lower()
+        for pat in VPN_PROCESS_PATTERNS:
+            if pat in low and name not in seen_vpn:
+                seen_vpn.add(name)
+                break
+        for pat in ACCELERATOR_PROCESS_PATTERNS:
+            if pat in low and name not in seen_acc:
+                seen_acc.add(name)
+                break
+    findings["vpn_processes"] = sorted(seen_vpn)
+    findings["accelerator_processes"] = sorted(seen_acc)
+
+    return findings
+
+
+def has_vpn_like_setup(findings):
+    """True if any VPN / proxy / accelerator indicator was found."""
+    return bool(
+        findings.get("system_proxy")
+        or findings.get("vpn_processes")
+        or findings.get("accelerator_processes")
+    )
+
+
+def print_vpn_warning(findings):
+    """Print a multi-line Chinese warning for detected VPN/accelerator items."""
+    if not has_vpn_like_setup(findings):
+        return
+    log("=" * 60)
+    log("[警告] 检测到 VPN / 代理 / 游戏加速器，可能干扰服务端：")
+    if findings.get("system_proxy"):
+        log(f"       - 系统代理        : {findings['system_proxy']}")
+        log("         (系统代理不影响 UDP 转发，但可能影响 HTTP 测试。)")
+    if findings.get("vpn_processes"):
+        log(f"       - VPN 客户端进程  : {', '.join(findings['vpn_processes'])}")
+        log("         (全隧道 VPN 可能导致自动检测到错误的 IPv6 地址，")
+        log("          或使外部客户端无法路由到本机。建议在配置中手动指定 listen_ipv6。)")
+    if findings.get("accelerator_processes"):
+        log(f"       - 游戏加速器进程  : {', '.join(findings['accelerator_processes'])}")
+        log("         (加速器可能劫持特定端口，影响外部客户端连接。)")
+    log("       建议：")
+    log("         1. 在 server_config.json 中设置 \"listen_ipv6\" 手动指定正确的 IPv6 地址。")
+    log("         2. 或关闭 VPN/加速器后重新启动。")
+    log("=" * 60)
 
 
 def load_or_create_config(path, default_config):
@@ -435,77 +610,140 @@ def list_local_global_ipv6_candidates():
 
 
 def test_ipv4():
-    """Test IPv4 public connectivity."""
-    try:
-        req = urllib.request.Request(IPV4_TEST_URL, method="HEAD")
-        orig_getaddrinfo = socket.getaddrinfo
-        def ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
-            return orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
-        socket.getaddrinfo = ipv4_only
+    """Test IPv4 public connectivity via raw TCP socket connect.
+
+    Uses TCP connect to port 443 on well-known anycast IPs. This bypasses
+    HTTP/SOCKS application-level proxies that break the old urllib approach.
+    Falls back to DNS-over-UDP query if TCP fails.
+    """
+    for host, port in IPV4_PROBE_TARGETS:
         try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                code = resp.status
-        finally:
-            socket.getaddrinfo = orig_getaddrinfo
-        if 200 <= code < 400:
-            log(f"  [OK]   IPv4 -> {IPV4_TEST_URL}  (HTTP {code})")
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5)
+            try:
+                s.connect((host, port))
+            finally:
+                s.close()
+            log(f"  [OK]   IPv4 -> {host}:{port}  (TCP connect)")
             return True
-        log(f"  [FAIL] IPv4 -> {IPV4_TEST_URL}  (HTTP {code})")
-        return False
-    except Exception as e:
-        log(f"  [FAIL] IPv4 test error: {e}")
-        return False
+        except OSError:
+            continue
+    for host, _port in IPV4_PROBE_TARGETS:
+        if _dns_udp_probe(host, socket.AF_INET):
+            log(f"  [OK]   IPv4 -> {host}  (DNS UDP)")
+            return True
+    log(f"  [FAIL] IPv4 -> all targets failed (TCP + UDP DNS)")
+    return False
 
 
 def test_ipv6():
-    """Test IPv6 public connectivity."""
-    try:
-        req = urllib.request.Request(IPV6_TEST_URL, method="HEAD")
-        orig_getaddrinfo = socket.getaddrinfo
-        def ipv6_only(host, port, family=0, type=0, proto=0, flags=0):
-            return orig_getaddrinfo(host, port, socket.AF_INET6, type, proto, flags)
-        socket.getaddrinfo = ipv6_only
+    """Test IPv6 public connectivity via raw TCP socket connect."""
+    for host, port in IPV6_PROBE_TARGETS:
         try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                code = resp.status
-        finally:
-            socket.getaddrinfo = orig_getaddrinfo
-        if 200 <= code < 400:
-            log(f"  [OK]   IPv6 -> {IPV6_TEST_URL}  (HTTP {code})")
+            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            s.settimeout(5)
+            try:
+                s.connect((host, port))
+            finally:
+                s.close()
+            log(f"  [OK]   IPv6 -> [{host}]:{port}  (TCP connect)")
             return True
-        log(f"  [FAIL] IPv6 -> {IPV6_TEST_URL}  (HTTP {code})")
-        return False
-    except Exception as e:
-        log(f"  [FAIL] IPv6 test error: {e}")
+        except OSError:
+            continue
+    for host, _port in IPV6_PROBE_TARGETS:
+        if _dns_udp_probe(host, socket.AF_INET6):
+            log(f"  [OK]   IPv6 -> [{host}]  (DNS UDP)")
+            return True
+    log(f"  [FAIL] IPv6 -> all targets failed (TCP + UDP DNS)")
+    return False
+
+
+def _dns_udp_probe(host, family):
+    """Send a minimal DNS query to `host`:53 and check for any response.
+
+    Returns True if a DNS response packet is received within 3 seconds.
+    """
+    query = (
+        b"\x12\x34"
+        b"\x01\x00"
+        b"\x00\x01"
+        b"\x00\x00"
+        b"\x00\x00"
+        b"\x00\x00"
+        b"\x01a"
+        b"\x03com"
+        b"\x00"
+        b"\x00\x01"
+        b"\x00\x01"
+    )
+    try:
+        s = socket.socket(family, socket.SOCK_DGRAM)
+        s.settimeout(3)
+        try:
+            s.sendto(query, (host, 53))
+            data, _ = s.recvfrom(512)
+            return len(data) >= 12 and (data[2] & 0x80) != 0
+        finally:
+            s.close()
+    except OSError:
         return False
 
 
-def run_network_tests():
+def check_ports_available(port_mappings, listen_ipv6):
+    """Pre-check port availability before starting the forwarder.
+
+    Returns list of (external_port, error_message) for ports that CANNOT
+    be bound. Empty list means all ports are available.
+    """
+    conflicts = []
+    for external_port, _target_ipv4, _target_port in port_mappings:
+        try:
+            s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            try:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except OSError:
+                pass
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except OSError:
+                pass
+            try:
+                s.bind((listen_ipv6, external_port))
+            finally:
+                s.close()
+        except OSError as e:
+            conflicts.append((external_port, str(e)))
+    return conflicts
+
+
+def run_network_tests(vpn_findings=None):
+    """Step 2: test IPv4 + IPv6 connectivity. Chinese output."""
     log("=" * 60)
-    log("Network connectivity test")
+    log("步骤 2/4：检测网络连通性")
     log("=" * 60)
     v4_ok = test_ipv4()
     v6_ok = test_ipv6()
     log("-" * 60)
-    if v4_ok and v6_ok:
-        log("[PASS] Both IPv4 and IPv6 are available.")
-        return True
-    if v4_ok:
-        log("[WARN] Only IPv4 is available. IPv6 is required for this server.")
+    all_ok = v4_ok and v6_ok
+    if all_ok:
+        log("[PASS] IPv4 和 IPv6 均可用。")
+    elif v4_ok:
+        log("[WARN] 仅 IPv4 可用。服务端需要 IPv6 供外部客户端连接。")
     elif v6_ok:
-        log("[WARN] Only IPv6 is available. IPv4 is required to reach local service.")
+        log("[WARN] 仅 IPv6 可用。服务端需要 IPv4 才能转发到本地服务。")
     else:
-        log("[FAIL] No public network access. Check your connection.")
+        log("[FAIL] 无法连接公网，请检查网络。")
+
+    if not all_ok and vpn_findings and has_vpn_like_setup(vpn_findings):
+        log("[HINT] 已检测到 VPN/代理/加速器（见上方步骤 1），")
+        log("       网络测试失败可能是干扰导致。")
     log("-" * 60)
-    return False
+    return all_ok
 
 
-def run_forwarder(port_mappings):
-    log("=" * 60)
-    log("Starting UDP IPv6 -> IPv4 forwarder")
-    log("=" * 60)
+def run_forwarder(port_mappings, listen_ipv6="::"):
+    log(f"监听地址: [{listen_ipv6}]")
 
-    listen_ipv6 = "::"
     buffer_size = DEFAULT_BUFFER_SIZE
     session_timeout = DEFAULT_SESSION_TIMEOUT
     cleanup_interval = DEFAULT_CLEANUP_INTERVAL
@@ -539,13 +777,13 @@ def run_forwarder(port_mappings):
             v6_sockets.append(sock)
             log(f"[OK]   IPv6 :{external_port}  ->  {target_ipv4}:{target_port}")
         except OSError as e:
-            log(f"[FAIL] Cannot bind IPv6 :{external_port}  ->  {e}")
+            log(f"[错误] 无法绑定 IPv6 :{external_port}  ->  {e}")
 
     if not v6_sockets:
-        log("No listening sockets. Exiting.")
+        log("[错误] 没有可用的监听端口，退出。")
         return 1
 
-    log(f"Forwarder running. {len(v6_sockets)} port(s). Ctrl+C to stop.")
+    log(f"转发器已启动，共 {len(v6_sockets)} 个端口。按 Ctrl+C 停止。")
     log("-" * 60)
 
     last_cleanup = time.time()
@@ -575,13 +813,13 @@ def run_forwarder(port_mappings):
                             "last_seen": now,
                         }
                         client_to_v4[key] = v4_sock
-                        log(f"[new]   {client_addr[0]}:{client_addr[1]}  ->  port {listen_port}")
+                        log(f"[新连接] {client_addr[0]}:{client_addr[1]}  ->  端口 {listen_port}")
                     else:
                         v4_to_session[v4_sock]["last_seen"] = now
                     try:
                         v4_sock.sendto(data, (target_ipv4, target_port))
                     except OSError as e:
-                        log(f"[err]   forward to {target_ipv4}:{target_port} failed: {e}")
+                        log(f"[错误] 转发到 {target_ipv4}:{target_port} 失败: {e}")
                 else:
                     session = v4_to_session.get(sock)
                     if session is None:
@@ -594,7 +832,7 @@ def run_forwarder(port_mappings):
                     try:
                         session["v6_sock"].sendto(data, session["client_addr"])
                     except OSError as e:
-                        log(f"[err]   reply to {session['client_addr']} failed: {e}")
+                        log(f"[错误] 回复 {session['client_addr']} 失败: {e}")
 
             if now - last_cleanup > cleanup_interval:
                 last_cleanup = now
@@ -606,83 +844,129 @@ def run_forwarder(port_mappings):
                     if client_to_v4.get(key) is s:
                         del client_to_v4[key]
                     s.close()
-                    log(f"[idle]  {sess['client_addr'][0]}:{sess['client_addr'][1]}  on port {sess['listen_port']} closed")
+                    log(f"[超时] {sess['client_addr'][0]}:{sess['client_addr'][1]}  端口 {sess['listen_port']} 的连接已关闭")
     except KeyboardInterrupt:
         log("-" * 60)
-        log("Stopping...")
+        log("正在停止...")
         for sock in v6_sockets:
             sock.close()
         for sock in list(v4_to_session.keys()):
             sock.close()
-        log("Stopped.")
+        log("已停止。")
     return 0
 
 
 def main():
+    # ============================================================
+    # 配置加载
+    # ============================================================
     log("=" * 60)
-    log("Server: loading config")
+    log("服务端：加载配置")
     log("=" * 60)
     cfg = load_or_create_config(SERVER_CONFIG_PATH, DEFAULT_SERVER_CONFIG)
     port_mappings = normalize_port_mappings(cfg.get("port_mappings", []), DEFAULT_TARGET_IPV4)
 
-    log(f"[cfg] server_config.json: {len(port_mappings)} port mapping(s)")
+    if not port_mappings:
+        log("[错误] 没有有效的端口映射，请检查 server_config.json")
+        return 1
+
+    log(f"[配置] 端口映射数: {len(port_mappings)}")
     for ext, ipv4, port in port_mappings:
         log(f"       {ext}  ->  {ipv4}:{port}")
 
-    log("-" * 60)
-
-    # Manual override: if the operator pinned an IPv6 in config, use it as-is.
-    # Accepts both the bare address and a [addr] form; case-insensitive.
+    # Manual override: listen_ipv6
     manual_ipv6 = cfg.get("listen_ipv6")
     if isinstance(manual_ipv6, str):
         manual_ipv6 = manual_ipv6.strip()
     if manual_ipv6:
-        log(f"[cfg] listen_ipv6 override: {manual_ipv6}")
-        log(f"[OK]   Local IPv6: {manual_ipv6}")
-        log(f"       External clients should connect to: [{manual_ipv6}]:<port>")
-        log("-" * 60)
+        log(f"[配置] listen_ipv6 手动指定: {manual_ipv6}")
+    log("-" * 60)
+
+    # ============================================================
+    # 步骤 1/4：检测 VPN / 代理 / 游戏加速器
+    # ============================================================
+    log("步骤 1/4：检测 VPN / 代理 / 游戏加速器...")
+    vpn_findings = None
+    try:
+        vpn_findings = detect_vpn_and_accelerators()
+        if has_vpn_like_setup(vpn_findings):
+            print_vpn_warning(vpn_findings)
+        else:
+            log("  [OK] 未检测到 VPN / 代理 / 游戏加速器")
+    except Exception as e:
+        log(f"  [WARN] VPN/加速器检测失败: {e}")
+    log("-" * 60)
+
+    # ============================================================
+    # 步骤 2/4：检测网络连通性 (IPv4 + IPv6)
+    # ============================================================
+    if not run_network_tests(vpn_findings=vpn_findings):
+        log("[错误] 网络测试失败，终止启动。")
+        return 1
+
+    # ============================================================
+    # 步骤 3/4：检测 IPv6 地址 + 端口占用
+    # ============================================================
+    log("=" * 60)
+    log("步骤 3/4：检测 IPv6 地址和端口占用...")
+    log("=" * 60)
+
+    if manual_ipv6:
+        listen_ipv6 = manual_ipv6
+        log(f"  [OK]   使用手动指定的 IPv6: {listen_ipv6}")
     else:
-        log("Detecting local global IPv6 address...")
         local_v6 = detect_local_global_ipv6()
         if local_v6:
-            log(f"[OK]   Local IPv6: {local_v6}")
-            log(f"       External clients should connect to: [{local_v6}]:<port>")
-            # Show all candidates so the operator can spot a wrong pick and
-            # pin the right one via listen_ipv6 in config.
+            listen_ipv6 = local_v6
+            log(f"  [OK]   自动检测到 IPv6: {listen_ipv6}")
+            # Show candidates if multiple or if selected is virtual
             try:
                 candidates = list_local_global_ipv6_candidates()
             except Exception:
                 candidates = []
-            # Always show the candidate list when there's more than one, or
-            # when the selected address is on a virtual interface (so the
-            # operator is warned and can override).
             selected_is_virtual = False
             for addr, _src, is_virt in candidates:
                 if addr == local_v6 and is_virt:
                     selected_is_virtual = True
                     break
             if selected_is_virtual:
-                log("[WARN] Auto-picked address is on a virtual/tunnel adapter.")
-                log("       This usually means no physical NIC with a real public")
-                log("       IPv6 was found (e.g. the host is fully behind a VPN).")
-                log("       Consider pinning the correct address via listen_ipv6.")
+                log("  [WARN] 自动选择的地址位于虚拟/隧道网卡上。")
+                log("         这通常意味着没有找到带真实公网 IPv6 的物理网卡")
+                log("         (例如主机完全在 VPN 后面)。")
+                log("         建议在配置中通过 listen_ipv6 手动指定正确地址。")
             if len(candidates) > 1 or selected_is_virtual:
-                log(f"       IPv6 candidates detected ({len(candidates)}):")
+                log(f"         IPv6 候选地址 ({len(candidates)} 个):")
                 for addr, src, is_virt in candidates:
-                    virt_tag = " [virtual]" if is_virt else ""
-                    sel_tag = "" if addr == local_v6 else "  (not selected)"
-                    log(f"         - {addr}   [via {src}{virt_tag}]{sel_tag}")
-                log("       If the selected address is wrong, pin the correct")
-                log("       one by adding \"listen_ipv6\": \"<addr>\" to server_config.json.")
+                    virt_tag = " [虚拟]" if is_virt else ""
+                    sel_tag = "" if addr == local_v6 else "  (未选中)"
+                    log(f"           - {addr}   [来源: {src}{virt_tag}]{sel_tag}")
+                log("         如果选中的地址不对，请在 server_config.json")
+                log("         中设置 \"listen_ipv6\": \"<addr>\" 手动指定。")
         else:
-            log("[WARN] No global IPv6 address detected. Will still listen on '::'.")
-            log("       You can pin one manually via \"listen_ipv6\" in server_config.json.")
-        log("-" * 60)
+            listen_ipv6 = "::"
+            log("  [WARN] 未检测到全局 IPv6 地址，将监听 '::'。")
+            log("         可通过 \"listen_ipv6\" 在配置中手动指定。")
 
-    if not run_network_tests():
-        log("Aborting: network tests failed.")
+    # Port pre-check
+    conflicts = check_ports_available(port_mappings, listen_ipv6)
+    if conflicts:
+        for ext_port, err in conflicts:
+            log(f"  [错误] 端口 {ext_port} 已被占用: {err}")
+        log("-" * 60)
+        log("[错误] 端口被占用，无法启动转发。")
+        log("       请关闭占用该端口的程序，或修改 server_config.json 中的端口。")
         return 1
-    return run_forwarder(port_mappings)
+    log(f"  [OK]   所有端口可用")
+    log(f"  [INFO] 外部客户端应连接到: [{listen_ipv6}]:<端口>")
+    log("-" * 60)
+
+    # ============================================================
+    # 步骤 4/4：启动转发
+    # ============================================================
+    log("=" * 60)
+    log("步骤 4/4：启动转发...")
+    log("=" * 60)
+    return run_forwarder(port_mappings, listen_ipv6=listen_ipv6)
 
 
 if __name__ == "__main__":
