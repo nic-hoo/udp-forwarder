@@ -1,0 +1,57 @@
+name: 跨平台二进制构建
+
+# 为 Windows / Linux / macOS 三平台构建 server / client 单文件可执行程序。
+# PyInstaller 不支持交叉编译，因此每个平台使用一个独立 job。
+#
+# 触发方式：手动触发（workflow_dispatch）或推送 v* 标签时自动触发。
+# 构建产物按 平台-目标 分别上传为 artifact，供下载。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装 PyInstaller
+        run: pip install pyinstaller
+
+      - name: 构建全部目标
+        run: python build.py all
+
+      - name: 上传 server 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.os }}
+          path: |
+            dist/server
+            dist/server.exe
+            dist/server_config.json
+          if-no-files-found: ignore
+
+      - name: 上传 client 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-${{ matrix.os }}
+          path: |
+            dist/client
+            dist/client.exe
+            dist/client_config.json
+          if-no-files-found: ignore
